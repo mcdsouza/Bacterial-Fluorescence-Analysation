@@ -1,0 +1,187 @@
+import tkinter as tk
+from tkinter import filedialog
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+class DataProcessor:
+    def __init__(self, master):
+        self.master = master
+        master.title("Data Processing and Plotting")
+        
+        self.load_button = tk.Button(master, text="Load Excel Data", command=self.load_data)
+        self.load_button.pack()
+
+        self.plot_button = tk.Button(master, text="Plot Data", command=self.plot_data)
+        self.plot_button.pack()
+
+        self.status_label = tk.Label(master, text="Status: Waiting for data...")
+        self.status_label.pack()
+
+        self.data_OD600 = None
+        self.data_FL = None
+        self.Time = None
+        self.OD_BKG = None
+        self.FL_BKG = None
+        self.F_corrected = None
+        self.Time_correspondence = None
+        self.x = None
+        self.promoter_activity = {}
+
+    def load_data(self):
+        filepath = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
+        if filepath:
+            self.data_OD600 = pd.read_excel(filepath, sheet_name='OD600').to_numpy()
+            self.data_FL = pd.read_excel(filepath, sheet_name='Raw FL').to_numpy()
+            self.Time = self.data_OD600[:, 0]
+            self.status_label.config(text="Data loaded successfully.")
+    
+    def cubic_spline(self, x, y, num_points=1000):
+        """
+        Custom cubic spline interpolation
+        Returns interpolated x and y values.
+        """
+        x_interp = np.linspace(min(x), max(x), num_points)
+        y_interp = np.interp(x_interp, x, y)  # Linear interpolation as a base
+        return x_interp, y_interp
+
+    def background_subtraction(self):
+        """
+        Perform background subtraction and compute corrected fluorescence.
+        """
+        # Background calculation (mean of last 3 columns for both OD600 and FL)
+        self.FL_BKG = np.mean(self.data_FL[:, 25:28], axis=1)
+        self.OD_BKG = np.mean(self.data_OD600[:, 25:28], axis=1)
+
+        # Correct the raw fluorescence by background subtraction
+        num_columns = self.data_FL.shape[1]
+        self.x = {}
+        self.F_corrected = {}
+        self.Time_correspondence = {}
+
+        for i in range(1, num_columns):
+            self.x[i], _ = self.cubic_spline(self.data_OD600[:, i], self.data_FL[:, i])
+
+            # Interpolate background fluorescence to subtract
+            _, BK_spline = self.cubic_spline(self.OD_BKG, self.FL_BKG)
+            _, FL_spline = self.cubic_spline(self.data_OD600[:, i], self.data_FL[:, i])
+
+            self.F_corrected[i] = FL_spline - BK_spline
+            self.Time_correspondence[i] = np.interp(self.x[i], self.data_OD600[:, i], self.Time)
+
+    def calculate_promoter_activity(self, GFP_degradation_rate=0.0042):
+        """
+        Calculate promoter activity F(t) based on corrected fluorescence and OD over time.
+        """
+        for i in range(1, len(self.F_corrected)):
+            time_values = self.Time_correspondence[i]
+            fluorescence_values = self.F_corrected[i]
+            OD_values = np.interp(time_values, self.Time, self.data_OD600[:, i])
+
+            # Time derivative of fluorescence
+            dI_dt = np.gradient(fluorescence_values, time_values)
+
+            # Promoter activity equation
+            promoter_activity = (dI_dt / OD_values) + GFP_degradation_rate * (fluorescence_values / OD_values)
+            self.promoter_activity[i] = promoter_activity
+
+    def plot_data(self):
+        if self.data_OD600 is None or self.data_FL is None:
+            self.status_label.config(text="Please load the data first.")
+            return
+        
+        self.background_subtraction()
+
+        # Plot raw fluorescence vs OD
+        plt.figure(figsize=(12, 8))
+        p = 1
+        names = ['DMSO+Mg', 'DMSO', 'MRL-16+Mg', 'MRL-16']
+        for i in range(1, 12, 3):
+            plt.subplot(2, 4, p)
+            plt.scatter(self.data_OD600[:, i], self.data_FL[:, i], color='r', label=f'Sample {i}')
+            plt.scatter(self.data_OD600[:, i + 1], self.data_FL[:, i + 1], color='g', label=f'Sample {i+1}')
+            plt.scatter(self.data_OD600[:, i + 2], self.data_FL[:, i + 2], color='b', label=f'Sample {i+2}')
+            plt.scatter(self.OD_BKG, self.FL_BKG, color='k', label='Background')
+            
+            plt.xlabel('OD')
+            plt.ylabel('Raw Fluorescence')
+            plt.title(names[p-1])
+            plt.ylim([0, 400000])
+            p += 1
+
+        plt.tight_layout()
+        plt.show()
+
+        # Plot corrected fluorescence vs OD
+        plt.figure(figsize=(12, 8))
+        p = 1
+        for i in range(1, 12, 3):
+            plt.subplot(2, 4, p)
+            plt.plot(self.x[i], self.F_corrected[i], 'r')
+            plt.plot(self.x[i+1], self.F_corrected[i+1], 'g')
+            plt.plot(self.x[i+2], self.F_corrected[i+2], 'b')
+            plt.xlabel('OD')
+            plt.ylabel('Corrected Fluorescence')
+            plt.title(names[p-1])
+            plt.ylim([0, 400000])
+            p += 1
+        plt.tight_layout()
+        plt.show()
+
+        # Plot Time vs OD (Figure 3)
+        plt.figure(figsize=(12, 8))
+        p = 1
+        for i in range(1, 12, 3):
+            plt.subplot(2, 4, p)
+            plt.scatter(self.Time_correspondence[i], self.data_OD600[:, i], color='r', label=f'Sample {i}')
+            plt.scatter(self.Time_correspondence[i+1], self.data_OD600[:, i+1], color='g', label=f'Sample {i+1}')
+            plt.scatter(self.Time_correspondence[i+2], self.data_OD600[:, i+2], color='b', label=f'Sample {i+2}')
+            plt.xlabel('Time (min)')
+            plt.ylabel('OD600')
+            plt.title(f'Time vs OD600 {names[p-1]}')
+            p += 1
+
+        plt.tight_layout()
+        plt.show()
+
+        # Plot corrected fluorescence vs time
+        plt.figure(figsize=(12, 8))
+        p = 1
+        for i in range(1, 12, 3):
+            plt.subplot(2, 4, p)
+            plt.plot(self.Time_correspondence[i], self.F_corrected[i], 'r', label=f'Sample {i}')
+            plt.plot(self.Time_correspondence[i+1], self.F_corrected[i+1], 'g', label=f'Sample {i+1}')
+            plt.plot(self.Time_correspondence[i+2], self.F_corrected[i+2], 'b', label=f'Sample {i+2}')
+            plt.xlabel('Time (min)')
+            plt.ylabel('Corrected Fluorescence')
+            plt.title(names[p-1])
+            plt.ylim([0, 200000])
+            p += 1
+
+        plt.tight_layout()
+        plt.show()
+
+        # Calculate promoter activity and plot it (Figure 5)
+        self.calculate_promoter_activity()
+
+        plt.figure(figsize=(12, 8))
+        p = 1
+        for i in range(1, 12, 3):
+            plt.subplot(2, 4, p)
+            plt.plot(self.Time_correspondence[i], self.promoter_activity[i], 'r', label=f'Sample {i}')
+            plt.plot(self.Time_correspondence[i+1], self.promoter_activity[i+1], 'g', label=f'Sample {i+1}')
+            plt.plot(self.Time_correspondence[i+2], self.promoter_activity[i+2], 'b', label=f'Sample {i+2}')
+            plt.xlabel('Time (min)')
+            plt.ylabel('Promoter Activity')
+            plt.title(f'Promoter Activity {names[p-1]}')
+            p += 1
+
+        plt.tight_layout()
+        plt.show()
+
+        
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DataProcessor(master=root)
+    root.mainloop()
