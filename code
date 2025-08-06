@@ -1,0 +1,358 @@
+import tkinter as tk
+from tkinter import filedialog
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import csaps
+
+class DataProcessor:
+    def __init__(self, master):
+        self.master = master
+        master.title("Data Processing and Plotting")
+
+        self.load_button = tk.Button(master, text="Load Excel Data", command=self.load_data)
+        self.load_button.pack()
+
+        self.plot_button = tk.Button(master, text="Plot Data", command=self.plot_data)
+        self.plot_button.pack()
+
+        self.status_label = tk.Label(master, text="Status: Waiting for data...")
+        self.status_label.pack()
+
+        self.data_OD600 = None
+        self.data_FL = None
+        self.Time = None
+        self.OD_BKG = None
+        self.FL_BKG = None
+        self.STD_BKG = None
+        self.F_corrected = {}
+        self.F_corrected_02 = {}
+        self.F_corrected_03 = {}
+        self.Time_correspondence = {}
+        self.promoter_activity = {}
+        self.x = {}
+
+    def load_data(self):
+        filepath = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
+        if filepath:
+            self.data_OD600 = pd.read_excel(filepath, sheet_name='OD600').to_numpy()
+            self.data_FL = pd.read_excel(filepath, sheet_name='Raw FL').to_numpy()
+            self.Time = self.data_OD600[:, 0]
+            self.status_label.config(text="Data loaded successfully.")
+
+    def cubic_spline(self, x, y, num_points=1000):
+        """
+        Custom cubic spline interpolation using csaps.
+        """
+        x_interp = np.linspace(min(x), max(x), num_points)
+        y_interp = csaps.csaps(x, y)(x_interp)
+        return x_interp, y_interp
+
+    def background_subtraction(self):
+        """
+        Perform background subtraction and compute corrected fluorescence.
+        """
+        self.FL_BKG = np.mean(self.data_FL[:, 25:28], axis=1)
+        self.OD_BKG = np.mean(self.data_OD600[:, 25:28], axis=1)
+        self.STD_BKG = 2 * np.mean(np.std(self.data_FL[:, 25:28], axis=1))
+
+        # Fit background fluorescence
+        self.BKD_csaps_results = csaps.csaps(self.OD_BKG, self.FL_BKG)
+
+        # Correct the raw fluorescence by background subtraction
+        num_columns = self.data_FL.shape[1]
+
+        for i in range(1, num_columns):
+            FL_csaps_result = csaps.csaps(self.data_OD600[:, i], self.data_FL[:, i])
+
+            self.x[i], FL_smooth = self.cubic_spline(self.data_OD600[:, i], self.data_FL[:, i])
+            _, BK_smooth = self.cubic_spline(self.OD_BKG, self.FL_BKG)
+
+            self.F_corrected[i] = FL_smooth - BK_smooth
+            self.F_corrected_02[i] = csaps.csaps(self.x[i], self.F_corrected[i])
+            self.F_corrected_03[i] = self.F_corrected_02[i](self.x[i])
+
+            self.Time_correspondence[i] = np.interp(self.x[i], self.data_OD600[:, i], self.Time)
+
+    def calculate_promoter_activity(self, GFP_degradation_rate=0.0042):
+        """
+        Calculate promoter activity F(t) based on corrected fluorescence and OD over time.
+        """
+        for i in range(1, len(self.F_corrected_03)):
+            time_values = self.Time_correspondence[i]
+            fluorescence_values = self.F_corrected_03[i]
+            OD_values = np.interp(time_values, self.Time, self.data_OD600[:, i])
+
+            # Time derivative of fluorescence
+            dI_dt = np.gradient(fluorescence_values, time_values)
+
+            # Promoter activity equation
+            promoter_activity = (dI_dt / OD_values) + GFP_degradation_rate * (fluorescence_values / OD_values)
+            self.promoter_activity[i] = promoter_activity
+
+    def plot_data(self):
+        if self.data_OD600 is None or self.data_FL is None:
+            self.status_label.config(text="Please load the data first.")
+            return
+
+        self.background_subtraction()
+
+        #Figure 1
+        self.plot_fluoresence_vs_od()
+        #Figure 2
+        self.plot_corrected_vs_od()
+        #Figure 3
+        self.plot_time_vs_od()
+        #Figure 4
+        self.plot_corrected_vs_time()
+
+        self.calculate_promoter_activity()
+        # Figure 5
+        self.plot_promoter_activity()
+        # Figure 6
+        self.plot_avg_promoter_activity()
+        # Figure 7
+        self.plot_promoter_activity_alternate_gamma(0.005)
+        # Figure 8
+        self.plot_filtered_fluorescence()
+
+    #Figure 1
+    def plot_fluoresence_vs_od(self):
+        plt.figure(figsize=(12, 8))
+        p = 1
+        names = ['DMSO+Mg', 'DMSO', 'MRL-16+Mg', 'MRL-16', 'RCS DMSO+Mg', 'RCS DMSO', 'RCS MRL-16+Mg', 'RCS MRL-16']
+
+        for i in range(1, 24, 3):
+            axis = plt.subplot(2, 4, p)
+            
+            # Plot the raw data points
+            plt.scatter(self.data_OD600[:, i], self.data_FL[:, i], color='r', label=f'Sample {i}')
+            plt.scatter(self.data_OD600[:, i + 1], self.data_FL[:, i + 1], color='g', label=f'Sample {i+1}')
+            plt.scatter(self.data_OD600[:, i + 2], self.data_FL[:, i + 2], color='b', label=f'Sample {i+2}')
+            plt.scatter(self.OD_BKG, self.FL_BKG, color='k', label='Background')
+
+            # Create a set of x values for plotting the fitted splines
+            # Adjust the x_vals to match the range of each sample's data
+            x_vals_i = np.linspace(self.data_OD600[:, i].min(), self.data_OD600[:, i].max(), 1000)
+            x_vals_i1 = np.linspace(self.data_OD600[:, i+1].min(), self.data_OD600[:, i+1].max(), 1000)
+            x_vals_i2 = np.linspace(self.data_OD600[:, i+2].min(), self.data_OD600[:, i+2].max(), 1000)
+            x_vals_bkg = np.linspace(self.OD_BKG.min(), self.OD_BKG.max(), 1000)
+
+            # Plot background fitted spline (use x_vals_bkg for background fit)
+            plt.plot(x_vals_bkg, self.BKD_csaps_results(x_vals_bkg), 'k', label='Background Fit')
+
+            # Plot fitted splines for each sample within the range of their data
+            plt.plot(x_vals_i, csaps.csaps(self.data_OD600[:, i], self.data_FL[:, i])(x_vals_i), 'r', label=f'Fit Sample {i}')
+            plt.plot(x_vals_i1, csaps.csaps(self.data_OD600[:, i+1], self.data_FL[:, i+1])(x_vals_i1), 'g', label=f'Fit Sample {i+1}')
+            plt.plot(x_vals_i2, csaps.csaps(self.data_OD600[:, i+2], self.data_FL[:, i+2])(x_vals_i2), 'b', label=f'Fit Sample {i+2}')
+
+            plt.xlabel('OD')
+            plt.ylabel('Raw Fluorescence')
+            plt.title(names[p-1])
+            plt.ylim([0, 400000])
+            plt.axis([0, 0.6, 0 if p < 5 else 90000, 400000 if p < 5 else 130000])
+            
+            p += 1
+
+        plt.tight_layout()
+        plt.show()
+
+    #Figure 2
+    def plot_corrected_vs_od(self):
+        plt.figure(figsize=(12, 8))
+        p = 1
+        names = ['DMSO+Mg', 'DMSO', 'MRL-16+Mg', 'MRL-16', 'RCS DMSO+Mg', 'RCS DMSO', 'RCS MRL-16+Mg', 'RCS MRL-16']
+        for i in range(1, 24, 3):
+            plt.subplot(2, 4, p)
+            plt.plot(self.x[i], self.F_corrected_03[i], 'r')
+            plt.plot(self.x[i+1], self.F_corrected_03[i+1], 'g')
+            plt.plot(self.x[i+2], self.F_corrected_03[i+2], 'b')
+            plt.xlabel('OD')
+            plt.ylabel('Corrected Fluorescence')
+            plt.title(names[p-1])
+            plt.axis([0, 0.6, 0 if p < 5 else -5000, 200000 if p < 5 else 20000])
+            p += 1
+        plt.tight_layout()
+        plt.show()
+
+    #Figure 3
+    def plot_time_vs_od(self):
+        plt.figure(figsize=(12, 8))
+        p = 1
+        names = ['DMSO+Mg', 'DMSO', 'MRL-16+Mg', 'MRL-16', 'RCS DMSO+Mg', 'RCS DMSO', 'RCS MRL-16+Mg', 'RCS MRL-16']
+        for i in range(1, 24, 3):
+            plt.subplot(2, 4, p)
+            plt.plot(self.x[i], self.Time_correspondence[i], 'r')
+            plt.plot(self.x[i+1], self.Time_correspondence[i+1], 'g')
+            plt.plot(self.x[i+2], self.Time_correspondence[i+2], 'b')
+            plt.xlabel('OD')
+            plt.ylabel('Time (min)')
+            plt.title(names[p-1])
+            plt.axis([0, 0.6, 0, 150])
+            p += 1
+        plt.tight_layout()
+        plt.show()
+
+    #Figure 4
+    def plot_corrected_vs_time(self):
+        plt.figure(figsize=(12, 8))
+        p = 1
+        names = ['DMSO+Mg', 'DMSO', 'MRL-16+Mg', 'MRL-16', 'RCS DMSO+Mg', 'RCS DMSO', 'RCS MRL-16+Mg', 'RCS MRL-16']
+        for i in range(1, 24, 3):
+            plt.subplot(2, 4, p)
+            plt.plot(self.Time_correspondence[i], self.F_corrected_03[i], 'r')
+            plt.plot(self.Time_correspondence[i+1], self.F_corrected_03[i+1], 'g')
+            plt.plot(self.Time_correspondence[i+2], self.F_corrected_03[i+2], 'b')
+            plt.xlabel('Time (min)')
+            plt.ylabel('Corrected Fluorescence')
+            plt.title(names[p-1])
+            plt.axis([0, 150, 0 if p < 5 else -5000, 200000 if p < 5 else 20000])
+            p += 1
+        plt.tight_layout()
+        plt.show()
+
+    # Figure 5: Promoter Activity vs Time
+    def plot_promoter_activity(self):
+        plt.figure(figsize=(12, 8))
+        p = 1
+        names = ['DMSO+Mg', 'DMSO', 'MRL-16+Mg', 'MRL-16', 'RCS DMSO+Mg', 'RCS DMSO', 'RCS MRL-16+Mg', 'RCS MRL-16']
+        
+        for i in range(1, 24, 3):
+            plt.subplot(2, 4, p)
+            plt.plot(self.Time_correspondence[i], self.promoter_activity[i], 'r')
+            plt.plot(self.Time_correspondence[i+1], self.promoter_activity[i+1], 'g')
+            plt.plot(self.Time_correspondence[i+2], self.promoter_activity[i+2], 'b')
+            plt.xlabel('Time (min)')
+            plt.ylabel('Promoter Activity')
+            plt.title(names[p-1])
+            p += 1
+
+        plt.tight_layout()
+        plt.show()
+
+    # Figure 6: Average Promoter Activity with Standard Deviation
+    def plot_avg_promoter_activity(self):
+        plt.figure(figsize=(12, 8))
+
+        # SigmaE activity subplot
+        plt.subplot(1, 2, 1)
+        self.plot_promoter_activity_avg_for_conditions([1, 2, 3, 4], 'SigmaE Activity')  # SigmaE conditions
+
+        # Rcs activity subplot
+        plt.subplot(1, 2, 2)
+        self.plot_promoter_activity_avg_for_conditions([5, 6, 7, 8], 'Rcs Activity')  # RCS conditions
+
+        plt.tight_layout()
+        plt.show()
+
+    # Average promoter activity for specific conditions
+    def plot_promoter_activity_avg_for_conditions(self, condition_indices, title):
+        conditions = ['DMSO+Mg', 'DMSO', 'MRL-16+Mg', 'MRL-16', 'RCS DMSO+Mg', 'RCS DMSO', 'RCS MRL-16+Mg', 'RCS MRL-16']
+        replicates = {
+            'DMSO+Mg': [self.promoter_activity[1], self.promoter_activity[2], self.promoter_activity[3]],
+            'DMSO': [self.promoter_activity[4], self.promoter_activity[5], self.promoter_activity[6]],
+            'MRL-16+Mg': [self.promoter_activity[7], self.promoter_activity[8], self.promoter_activity[9]],
+            'MRL-16': [self.promoter_activity[10], self.promoter_activity[11], self.promoter_activity[12]],
+            'RCS DMSO+Mg': [self.promoter_activity[13], self.promoter_activity[14], self.promoter_activity[15]],
+            'RCS DMSO': [self.promoter_activity[16], self.promoter_activity[17], self.promoter_activity[18]],
+            'RCS MRL-16+Mg': [self.promoter_activity[19], self.promoter_activity[20], self.promoter_activity[21]],
+            'RCS MRL-16': [self.promoter_activity[22], self.promoter_activity[23], self.promoter_activity[24]],
+        }
+
+        for idx in condition_indices:
+            condition = conditions[idx - 1]
+            mean_activity = np.mean(replicates[condition], axis=0)
+            std_activity = np.std(replicates[condition], axis=0)
+
+            time = self.Time_correspondence[1]
+
+            plt.plot(time, mean_activity, label=condition)
+            plt.fill_between(time, mean_activity - std_activity, mean_activity + std_activity, alpha=0.2)
+
+        plt.title(title)
+        plt.xlabel('Time (min)')
+        plt.ylabel('Promoter Activity')
+        plt.legend()
+
+    # Figure 7: Promoter Activity with Different Gamma Value
+    def plot_promoter_activity_alternate_gamma(self, GFP_degradation_rate):
+        self.calculate_promoter_activity(GFP_degradation_rate)
+
+        plt.figure(figsize=(12, 8))
+
+        # SigmaE activity subplot
+        plt.subplot(1, 2, 1)
+        self.plot_promoter_activity_avg_for_conditions([1, 2, 3, 4], 'SigmaE Activity (γ={:.4f})'.format(GFP_degradation_rate))
+
+        # Rcs activity subplot
+        plt.subplot(1, 2, 2)
+        self.plot_promoter_activity_avg_for_conditions([5, 6, 7, 8], 'Rcs Activity (γ={:.4f})'.format(GFP_degradation_rate))
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_promoter_activity_avg_for_conditions(self, condition_indices, title):
+        conditions = ['DMSO+Mg', 'DMSO', 'MRL-16+Mg', 'MRL-16', 'RCS DMSO+Mg', 'RCS DMSO', 'RCS MRL-16+Mg', 'RCS MRL-16']
+        replicates = {
+            'DMSO+Mg': [self.promoter_activity[1], self.promoter_activity[2], self.promoter_activity[3]],
+            'DMSO': [self.promoter_activity[4], self.promoter_activity[5], self.promoter_activity[6]],
+            'MRL-16+Mg': [self.promoter_activity[7], self.promoter_activity[8], self.promoter_activity[9]],
+            'MRL-16': [self.promoter_activity[10], self.promoter_activity[11], self.promoter_activity[12]],
+            'RCS DMSO+Mg': [self.promoter_activity[13], self.promoter_activity[14], self.promoter_activity[15]],
+            'RCS DMSO': [self.promoter_activity[16], self.promoter_activity[17], self.promoter_activity[18]],
+            'RCS MRL-16+Mg': [self.promoter_activity[19], self.promoter_activity[20], self.promoter_activity[21]],
+            'RCS MRL-16': [self.promoter_activity[22], self.promoter_activity[23], self.promoter_activity[24]],
+        }
+
+        for idx in condition_indices:
+            condition = conditions[idx - 1]
+            mean_activity = np.mean(replicates[condition], axis=0)
+            std_activity = np.std(replicates[condition], axis=0)
+
+            time = self.Time_correspondence[1]
+
+            plt.plot(time, mean_activity, label=condition)
+            plt.fill_between(time, mean_activity - std_activity, mean_activity + std_activity, alpha=0.2)
+
+        plt.title(title)
+        plt.xlabel('Time (min)')
+        plt.ylabel('Promoter Activity')
+        plt.legend()
+
+    # Figure 8: Corrected Fluorescence Divided by OD600
+    def plot_filtered_fluorescence(self):
+        plt.figure(figsize=(12, 8))
+
+        # SigmaE activity subplot
+        plt.subplot(1, 2, 1)
+        self.plot_corrected_fluorescence_avg_for_conditions([1, 2, 3, 4], 'SigmaE Activity')
+
+        # Rcs activity subplot
+        plt.subplot(1, 2, 2)
+        self.plot_corrected_fluorescence_avg_for_conditions([5, 6, 7, 8], 'Rcs Activity')
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_corrected_fluorescence_avg_for_conditions(self, condition_indices, title):
+        conditions = ['DMSO+Mg', 'DMSO', 'MRL-16+Mg', 'MRL-16', 'RCS DMSO+Mg', 'RCS DMSO', 'RCS MRL-16+Mg', 'RCS MRL-16']
+
+        for i in condition_indices:
+            above_background = self.F_corrected_03[i] > (2 * self.STD_BKG)
+            time_filtered = self.Time_correspondence[i][above_background]
+            fluorescence_filtered = self.F_corrected_03[i][above_background]
+
+            # Divide by OD600
+            filtered_fluorescence_by_od = fluorescence_filtered / self.x[i][above_background]
+
+            plt.plot(time_filtered, filtered_fluorescence_by_od, label=conditions[i-1])
+
+        plt.title(title)
+        plt.xlabel('Time (min)')
+        plt.ylabel('Corrected Fluorescence / OD600')
+        plt.legend()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = DataProcessor(master=root)
+    root.mainloop()
